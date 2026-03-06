@@ -44,12 +44,12 @@ echo "Do you want to install the fonts, Sir ?? [Y/n]: "
 read fontans
 
 if [[ $fontans == "y" || $fontans == "Y" ]]; then
-  cd ~/laxmikant-terminal/fonts/
-  sleep 1
-  sudo cp -r * /usr/share/fonts
+  sudo cp -r ~/laxmikant-terminal/fonts/* /usr/share/fonts
+  sleep 2
   sudo fc-cache -fv
   sleep 2
   cd ~
+  
 else
   echo "Skipping font installation..."
 fi
