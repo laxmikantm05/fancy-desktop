@@ -30,8 +30,8 @@ run_apt_script() {
     # │       YOUR APT SCRIPT GOES HERE     │
     # └─────────────────────────────────────┘
 
-    apt update
-    apt install -y curl git
+    sudo apt update && sudo apt upgrade -y
+    sudo apt install -y curl git fish fastfetch gnome-extensions-app pipx 
 
 }
 
@@ -41,8 +41,8 @@ run_dnf_script() {
     # │       YOUR DNF SCRIPT GOES HERE     │
     # └─────────────────────────────────────┘
 
-    dnf check-update
-    dnf install -y curl git
+    sudo dnf update
+    sudo dnf install -y curl git fish fastfetch gnome-extensions-app pipx 
 
 }
 
