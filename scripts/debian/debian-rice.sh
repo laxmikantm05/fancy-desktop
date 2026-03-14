@@ -29,6 +29,7 @@ EXTENSIONS=(
     "burn-my-windows@schneegans.github.com"
     "compiz-windows-effect@hermes83.github.com"
     "kiwi@kemma"
+    "openbar@neuromorph"
 )
 # ─────────────────────────────────────────────
 
