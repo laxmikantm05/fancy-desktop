@@ -330,7 +330,13 @@ module_reboot() {
 main() {
     clear
     install_gum
-    banner "Fancy Desktop"
+    
+    # lavender only for the main title
+    figlet -f standard "Fancy Desktop" | while IFS= read -r line; do
+        echo -e "\033[38;5;183m${line}${RESET}"
+    done
+    echo ""
+
     gum style \
         --foreground="#888888" \
         --margin="0 2" \
