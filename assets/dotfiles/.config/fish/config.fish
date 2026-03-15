@@ -1,14 +1,22 @@
-# Hide default fish greeting
+# ─────────────────────────────────────────
+#  GENERAL
+# ─────────────────────────────────────────
+
 set fish_greeting
 
-# Add ~/.local/bin to PATH
 if test -d ~/.local/bin
     if not contains -- ~/.local/bin $PATH
         set -p PATH ~/.local/bin
     end
 end
 
-# Lambda-style prompt
+
+
+
+# ─────────────────────────────────────────
+#  PROMPT
+# ─────────────────────────────────────────
+
 function fish_prompt
     set -l last_status $status
     if not set -q __fish_prompt_hostname
@@ -47,7 +55,13 @@ function fish_prompt
     echo -n "$white╰─$__fish_prompt_char $normal"
 end
 
-# !! and !$ support
+
+
+
+# ─────────────────────────────────────────
+#  HISTORY
+# ─────────────────────────────────────────
+
 function __history_previous_command
     switch (commandline -t)
         case "!"
@@ -75,17 +89,21 @@ else
     bind '$' __history_previous_command_arguments
 end
 
-# Fancy command history
 function history
     builtin history --show-time='%F %T '
 end
 
-# Handy backup
+
+
+
+# ─────────────────────────────────────────
+#  UTILITY FUNCTIONS
+# ─────────────────────────────────────────
+
 function backup --argument filename
     cp $filename $filename.bak
 end
 
-# Copy DIR1 to DIR2 if directory
 function copy
     set count (count $argv | tr -d \n)
     if test "$count" = 2; and test -d "$argv[1]"
@@ -97,7 +115,13 @@ function copy
     end
 end
 
-# Aliases
+
+
+
+# ─────────────────────────────────────────
+#  ALIASES
+# ─────────────────────────────────────────
+
 alias tarnow='tar -acf '
 alias untar='tar -zxvf '
 alias wget='wget -c '
@@ -117,37 +141,80 @@ alias hw='hwinfo --short'
 alias big="expac -H M '%m\t%n' | sort -h | nl"
 
 
-# Apply pywal colors if available
+
+
+# ─────────────────────────────────────────
+    switch "$chosen"
+        case "*Lock*"
+            _typewrite "  initiating lock sequence..." '\033[38;5;201m'
+            sleep 0.2 & _spinner $last_pid "locking session" '\033[38;5;201m'
+            _do_lock
+
+        case "*Suspend*"
+            _typewrite "  entering suspend mode..." '\033[38;5;39m'
+            sleep 0.5 & _spinner $last_pid "suspending" '\033[38;5;39m'
+            systemctl suspend
+
+        case "*Logout*"
+            _typewrite "  preparing to logout..." '\033[38;5;51m'
+            _confirm_action "logout" "_do_logout"
+
+        case "*Reboot*"
+            _typewrite "  system reboot requested..." '\033[38;5;226m'
+            _confirm_action "reboot" "systemctl reboot"
+
+        case "*Shutdown*"
+            _typewrite "  initiating shutdown sequence..." '\033[38;5;196m'
+            _confirm_action "shutdown" "systemctl poweroff"
+
+        case "*Cancel*"
+            echo -e "\n$dim  aborted.$reset\n"
+
+        case ""
+            echo -e "\n$dim  aborted.$reset\n"
+    end
+end
+
+# ── power aliases ──
+alias bye='power'
+alias zzz='systemctl suspend'
+alias lock='_do_lock'
+alias reboot!='_confirm_action reboot "systemctl reboot"'
+alias shutdown!='_confirm_action shutdown "systemctl poweroff"'
+
+
+
+
+# ─────────────────────────────────────────
+#  HOOKS & STARTUP
+# ─────────────────────────────────────────
+
 if type "wal" > /dev/null 2>&1
     cat ~/.cache/wal/sequences
 end
 
-# Starship support
 starship init fish | source
 
-# Launch fastfetch on shell open (all info handled by fastfetch config)
-# fastfetch --logo blackarch
 fastfetch
 
-# Post-execution hook — only on failure
 function postexec --on-event fish_postexec
     if set -q __last_command_not_found
         set -e __last_command_not_found
         return
     end
 
-    if test $status -ne 0
+    set -l exit_code $argv[2]
+
+    if test -n "$exit_code"; and test "$exit_code" -ne 0
         set_color red
-        echo "❌ Task failed. Exit status: $status."
+        echo "❌ Task failed. Exit status: $exit_code."
         set_color normal
     end
 end
 
-# Command not found
 function fish_command_not_found
     set_color red
     echo "❓ Command '$argv' not found. Are you sure it's installed?"
     set_color normal
     set -g __last_command_not_found 1
 end
-
