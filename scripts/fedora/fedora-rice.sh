@@ -15,7 +15,7 @@ EXTENSIONS=(
     "just-perfection-desktop@just-perfection"
     "dash2dock-lite@icedman.github.com"
     "burn-my-windows@schneegans.github.com"
-    "compiz-windows-effect@hermes83.github.com
+    "compiz-windows-effect@hermes83.github.com"
     "kiwi@kemma"
 )
 
