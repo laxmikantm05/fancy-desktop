@@ -19,22 +19,19 @@ EXTENSIONS=(
     "kiwi@kemma"
 )
 
-ASSETS_DIR="$HOME/fancy-desktop/assets"
+# Paths are relative to this script's location — no hardcoded ~/fancy-desktop
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSETS_DIR="$SCRIPT_DIR/../../assets"
 DOTFILES_DIR="$ASSETS_DIR/dotfiles"
 FONTS_DIR="$ASSETS_DIR/fonts"
 
 # DCONF_BACKUP="$ASSETS_DIR/dconf-backup.ini"
-# WLOGOUT_CONFIG="$ASSETS_DIR/wlogout"
 
 # ─────────────────────────────────────────────
 #  COLORS
 # ─────────────────────────────────────────────
 
 CYAN='\033[38;5;51m'
-MAGENTA='\033[38;5;201m'
-YELLOW='\033[38;5;226m'
-RED='\033[38;5;196m'
-GREEN='\033[38;5;82m'
 DIM='\033[2m'
 RESET='\033[0m'
 BOLD='\033[1m'
@@ -42,18 +39,6 @@ BOLD='\033[1m'
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
-
-banner() {
-    echo ""
-    if command -v lolcat &>/dev/null; then
-        figlet -f standard "$1" | lolcat --freq 0.3 --seed 42
-    else
-        echo -e "${CYAN}${BOLD}"
-        figlet -f standard "$1"
-        echo -e "${RESET}"
-    fi
-    echo ""
-}
 
 section() {
     gum style \
@@ -78,10 +63,8 @@ confirm() {
         --unselected.foreground="#888888"
 }
 
-# ── silent spinner — fully automated commands with no useful output ──
 run_spin() {
-    local title="$1"
-    shift
+    local title="$1"; shift
     gum spin \
         --spinner=dot \
         --spinner.foreground="#00eeff" \
@@ -90,10 +73,8 @@ run_spin() {
         -- "$@"
 }
 
-# ── live output — title line then output flows below ──
 run_with_output() {
-    local title="$1"
-    shift
+    local title="$1"; shift
 
     echo ""
     echo -e "  ${CYAN}⠿  ${title}${RESET}"
@@ -111,14 +92,11 @@ run_with_output() {
         fail "$title failed (exit $cmd_exit)"
     fi
     echo ""
-
     return "$cmd_exit"
 }
 
-# ── for commands that need user interaction — no spinner, fully visible ──
 run_direct() {
-    local title="$1"
-    shift
+    local title="$1"; shift
     gum style \
         --foreground="#00eeff" \
         --border=rounded \
@@ -154,7 +132,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ─────────────────────────────────────────────
-#  GUARD — install gum if missing (Fedora/dnf)
+#  GUARD — install gum if missing
 # ─────────────────────────────────────────────
 
 install_gum() {
@@ -183,7 +161,7 @@ module_system_update() {
             gnome-menus \
             python3-gobject \
             pipx wlogout \
-            figlet rubygem-lolcat
+            figlet lolcat
         success "system updated and dependencies installed"
     else
         skip "system update"
@@ -195,7 +173,6 @@ module_shell() {
     section "Shell Setup"
     if confirm "Set fish as your default shell?"; then
 
-        # robustly get full path — check common locations as fallback
         FISH_PATH="$(command -v fish 2>/dev/null)"
         if [[ -z "$FISH_PATH" ]]; then
             for p in /usr/bin/fish /usr/local/bin/fish /bin/fish; do
@@ -208,20 +185,16 @@ module_shell() {
             return 1
         fi
 
-        # ensure fish is listed in /etc/shells (required by chsh)
         grep -qxF "$FISH_PATH" /etc/shells || echo "$FISH_PATH" | sudo tee -a /etc/shells > /dev/null
 
         run_direct "setting fish as default shell" chsh -s "$FISH_PATH"
-        if [[ $? -eq 0 ]]; then
-            success "fish set as default for $USER"
+        success "fish set as default for $USER"
 
-            if confirm "Also set fish as default for root?"; then
-                grep -qxF "$FISH_PATH" /etc/shells || echo "$FISH_PATH" | sudo tee -a /etc/shells > /dev/null
-                run_direct "setting fish for root" sudo chsh -s "$FISH_PATH" root
-                [[ $? -eq 0 ]] && success "fish set as default for root" || fail "could not set fish for root"
-            else
-                skip "root shell"
-            fi
+        if confirm "Also set fish as default for root?"; then
+            run_direct "setting fish for root" sudo chsh -s "$FISH_PATH" root
+            success "fish set as default for root"
+        else
+            skip "root shell"
         fi
     else
         skip "shell setup"
@@ -286,10 +259,12 @@ module_bootloader() {
     section "Bootloader Theme"
     if confirm "Install bootloader theme?"; then
         run_with_output "cloning bootloader themes" \
-            git clone https://github.com/ChrisTitusTech/Top-5-Bootloader-Themes
-        cd Top-5-Bootloader-Themes
+            git clone https://github.com/ChrisTitusTech/Top-5-Bootloader-Themes /tmp/bootloader-themes
+        cd /tmp/bootloader-themes
         run_direct "running bootloader installer" sudo ./install.sh
-        cd ..
+        run_with_output "updating grub config" \
+            sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+        cd "$SCRIPT_DIR"
         success "bootloader theme installed"
     else
         skip "bootloader"
