@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────
+#  CYBERPUNK WIFI MENU  —  impala-style TUI
+#  install: sudo cp wifimenu /usr/local/bin/ && sudo chmod +x /usr/local/bin/wifimenu
+#  deps: python3, nmcli
+# ─────────────────────────────────────────
+
+import curses
+import subprocess
+import threading
+import time
+import sys
+import os
+
+# ── nmcli helpers ────────────────────────────────────────────────
+
+def nmcli(*args):
+    try:
+        result = subprocess.run(
+            ["nmcli"] + list(args),
+            capture_output=True, text=True, timeout=10
+        )
+        return result.stdout.strip(), result.returncode
+    except Exception:
+        return "", 1
+
+def get_wifi_enabled():
+    out, _ = nmcli("radio", "wifi")
+    return out.strip() == "enabled"
+
+def get_active_ssid():
+    out, _ = nmcli("-t", "-f", "ACTIVE,SSID", "dev", "wifi")
+    for line in out.splitlines():
+        if line.startswith("yes:"):
+            return line[4:]
+    return None
+
+def get_active_ip():
+    out, _ = nmcli("-t", "-f", "ACTIVE,DEVICE", "dev", "wifi")
+    dev = None
+    for line in out.splitlines():
+        if line.startswith("yes:"):
+            dev = line[4:]
+            break
+    if not dev:
+        return None
+    out2, _ = nmcli("-t", "-f", "IP4.ADDRESS", "dev", "show", dev)
+    for line in out2.splitlines():
+        if "IP4.ADDRESS" in line:
+            return line.split(":")[-1].split("/")[0]
+    return None
+
+def scan_networks():
+    nmcli("dev", "wifi", "rescan")
+    time.sleep(1)
+    out, _ = nmcli("-t", "-f", "SSID,SIGNAL,SECURITY,ACTIVE", "dev", "wifi", "list")
+    seen = {}
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        ssid     = parts[0].strip()
+        signal   = parts[1].strip()
+        security = parts[2].strip()
+        active   = parts[3].strip()
+        if not ssid:
+            continue
+        sig_int = int(signal) if signal.isdigit() else 0
+        if ssid not in seen or sig_int > seen[ssid]["signal"]:
+            seen[ssid] = {
+                "ssid":     ssid,
+                "signal":   sig_int,
+                "security": security not in ("", "--"),
+                "active":   active == "yes",
+            }
+    return sorted(seen.values(), key=lambda x: x["signal"], reverse=True)
+
+def get_saved_networks():
+    out, _ = nmcli("-t", "-f", "NAME,TYPE", "con", "show")
+    return [l.split(":")[0] for l in out.splitlines() if "wireless" in l]
+
+def connect_network(ssid, password=None):
+    saved = get_saved_networks()
+    if ssid in saved:
+        _, rc = nmcli("con", "up", ssid)
+        return rc == 0
+    if password:
+        _, rc = nmcli("dev", "wifi", "connect", ssid, "password", password)
+        return rc == 0
+    _, rc = nmcli("dev", "wifi", "connect", ssid)
+    return rc == 0
+
+def disconnect_network():
+    out, _ = nmcli("-t", "-f", "ACTIVE,DEVICE", "dev", "wifi")
+    for line in out.splitlines():
+        if line.startswith("yes:"):
+            nmcli("dev", "disconnect", line[4:])
+            return True
+    return False
+
+def forget_network(ssid):
+    nmcli("con", "delete", ssid)
+
+def toggle_wifi():
+    if get_wifi_enabled():
+        nmcli("radio", "wifi", "off")
+    else:
+        nmcli("radio", "wifi", "on")
+
+# ── signal bars ──────────────────────────────────────────────────
+
+def signal_bars(sig):
+    if   sig >= 76: return "▂▄▆█"
+    elif sig >= 51: return "▂▄▆ "
+    elif sig >= 26: return "▂▄  "
+    else:           return "▂   "
+
+# ── password overlay ─────────────────────────────────────────────
+
+def password_prompt(stdscr, ssid):
+    h, w = stdscr.getmaxyx()
+    bh, bw = 7, min(58, w - 4)
+    by = h // 2 - bh // 2
+    bx = w // 2 - bw // 2
+
+    win = curses.newwin(bh, bw, by, bx)
+    win.bkgd(" ", curses.color_pair(1))
+    win.attron(curses.color_pair(3))
+    win.box()
+    win.attroff(curses.color_pair(3))
+
+    win.addstr(1, 2, f"  connect to: {ssid}"[:bw-4], curses.color_pair(3) | curses.A_BOLD)
+    win.addstr(3, 2, "  password: ", curses.color_pair(6))
+    win.addstr(5, 2, "  enter ↵ confirm    esc cancel", curses.color_pair(5))
+    win.refresh()
+
+    curses.curs_set(1)
+    password = ""
+    input_x  = 14
+
+    while True:
+        # draw password field
+        display = "●" * len(password)
+        win.addstr(3, input_x, " " * (bw - input_x - 2), curses.color_pair(1))
+        win.addstr(3, input_x, display[:bw - input_x - 2], curses.color_pair(3))
+        win.move(3, input_x + len(display))
+        win.refresh()
+
+        ch = win.getch()
+        if ch in (10, 13):
+            break
+        elif ch == 27:
+            password = None
+            break
+        elif ch in (127, curses.KEY_BACKSPACE, 8):
+            if password:
+                password = password[:-1]
+        elif 32 <= ch <= 126:
+            password += chr(ch)
+
+    curses.curs_set(0)
+    return password
+
+# ── main TUI ─────────────────────────────────────────────────────
+
+def main(stdscr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.start_color()
+
+    curses.init_pair(1,  -1,   -1)       # default
+    curses.init_pair(2,  238,  -1)       # dim
+    curses.init_pair(3,  51,   -1)       # cyan accent
+    curses.init_pair(4,  16,   51)       # selected row (black on cyan)
+    curses.init_pair(5,  240,  -1)       # footer hints
+    curses.init_pair(6,  201,  -1)       # pink accent
+    curses.init_pair(7,  82,   -1)       # green ok
+    curses.init_pair(8,  226,  -1)       # yellow warning
+    curses.init_pair(9,  196,  -1)       # red error
+    curses.init_pair(10, 82,   -1)       # active network
+
+    stdscr.bkgd(" ", curses.color_pair(1))
+    stdscr.keypad(True)
+    stdscr.nodelay(False)
+
+    networks     = []
+    selected     = 0
+    status_msg   = "  press r to scan networks"
+    status_color = 5
+    scanning     = False
+    scan_done    = threading.Event()
+
+    def do_scan():
+        nonlocal networks, scanning, status_msg, status_color
+        scanning     = True
+        status_msg   = "  scanning..."
+        status_color = 8
+        try:
+            networks     = scan_networks()
+            status_msg   = f"  found {len(networks)} network{'s' if len(networks) != 1 else ''}"
+            status_color = 7
+        except Exception as e:
+            status_msg   = f"  scan error: {e}"
+            status_color = 9
+        scanning = False
+        scan_done.set()
+
+    def draw():
+        nonlocal selected
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        bar  = "─" * (w - 2)
+
+        # ── borders + header ──
+        stdscr.addstr(0, 0, "╭" + bar + "╮", curses.color_pair(3))
+
+        wifi_on    = get_wifi_enabled()
+        ssid_now   = get_active_ssid()
+        ip_now     = get_active_ip()
+        wifi_label = "  WiFi: ON " if wifi_on else "  WiFi: OFF "
+        wifi_color = curses.color_pair(7) if wifi_on else curses.color_pair(9)
+
+        stdscr.addstr(1, 1, "  󰤨  wifimenu", curses.color_pair(3) | curses.A_BOLD)
+        stdscr.addstr(1, w - len(wifi_label) - 1, wifi_label, wifi_color | curses.A_BOLD)
+
+        if ssid_now:
+            conn = f"  ◉  {ssid_now}"
+            if ip_now:
+                conn += f"   ·   {ip_now}"
+            stdscr.addstr(2, 1, conn[:w-2], curses.color_pair(10))
+        else:
+            stdscr.addstr(2, 1, "  ○  not connected", curses.color_pair(2))
+
+        stdscr.addstr(3, 0, "├" + bar + "┤", curses.color_pair(3))
+
+        # ── column headers ──
+        hdr = f"   {'':4}  {'SSID':<30}  {'SEC':<5}  {'SIGNAL':>6}  STATUS"
+        stdscr.addstr(4, 0, hdr[:w], curses.color_pair(2) | curses.A_BOLD)
+        stdscr.addstr(5, 0, "├" + bar + "┤", curses.color_pair(3))
+
+        # ── list ──
+        list_start = 6
+        list_end   = h - 4
+        list_rows  = max(0, list_end - list_start)
+
+        if selected >= len(networks) and networks:
+            selected = len(networks) - 1
+
+        scroll = max(0, selected - list_rows + 1)
+
+        if not networks:
+            if not scanning:
+                stdscr.addstr(list_start + 1, 3,
+                    "  no networks found — press r to scan",
+                    curses.color_pair(2))
+        else:
+            for i in range(list_rows):
+                idx = i + scroll
+                if idx >= len(networks):
+                    break
+                net   = networks[idx]
+                y     = list_start + i
+                bars  = signal_bars(net["signal"])
+                lock  = "󰌾" if net["security"] else " "
+                ssid  = net["ssid"][:30]
+                sec   = "WPA" if net["security"] else "open"
+                sig   = f"{net['signal']:>3}%"
+                badge = "◉ connected" if net["active"] else ""
+                row   = f"  {bars}  {ssid:<30}  {sec:<5}  {sig:>6}  {badge}"
+
+                if idx == selected:
+                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.addstr(y, 0, " " * (w - 1))
+                    stdscr.addstr(y, 0, row[:w-1])
+                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                elif net["active"]:
+                    stdscr.addstr(y, 0, row[:w-1], curses.color_pair(10))
+                else:
+                    stdscr.addstr(y, 0, row[:w-1], curses.color_pair(1))
+
+        # ── bottom ──
+        stdscr.addstr(h - 4, 0, "├" + bar + "┤", curses.color_pair(3))
+        stdscr.addstr(h - 3, 1, (status_msg[:w-2]).ljust(w-2), curses.color_pair(status_color))
+        hints = "  ↑↓/jk navigate    ⏎ connect    d disconnect    f forget    t toggle    r rescan    q quit"
+        stdscr.addstr(h - 2, 0, hints[:w], curses.color_pair(5))
+        # can't write to the very last cell (h-1, w-1) — curses throws ERR
+        stdscr.addstr(h - 1, 0, "╰" + bar, curses.color_pair(3))
+
+        stdscr.refresh()
+
+    # ── event loop ──
+    while True:
+        draw()
+        key = stdscr.getch()
+
+        if key in (ord("q"), ord("Q"), 27):
+            break
+
+        elif key in (curses.KEY_DOWN, ord("j")):
+            if networks:
+                selected = min(selected + 1, len(networks) - 1)
+
+        elif key in (curses.KEY_UP, ord("k")):
+            if networks:
+                selected = max(selected - 1, 0)
+
+        elif key in (ord("r"), ord("R")):
+            if not scanning:
+                scan_done.clear()
+                threading.Thread(target=do_scan, daemon=True).start()
+                spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+                si = 0
+                stdscr.nodelay(True)
+                while not scan_done.is_set():
+                    h, w = stdscr.getmaxyx()
+                    msg = f"  {spinner[si % len(spinner)]}  scanning networks..."
+                    stdscr.addstr(h - 3, 1, msg[:w-2].ljust(w-2), curses.color_pair(8))
+                    stdscr.refresh()
+                    si += 1
+                    time.sleep(0.08)
+                stdscr.nodelay(False)
+                selected = 0
+
+        elif key in (10, 13, curses.KEY_ENTER):
+            if not networks:
+                status_msg, status_color = "  no networks — press r to scan first", 8
+                continue
+            net = networks[selected]
+            if net["active"]:
+                status_msg, status_color = f"  already connected to {net['ssid']}", 8
+                continue
+            password = None
+            if net["security"]:
+                password = password_prompt(stdscr, net["ssid"])
+                if password is None:
+                    status_msg, status_color = "  cancelled", 5
+                    continue
+            status_msg, status_color = f"  connecting to {net['ssid']}...", 8
+            draw()
+            ok = connect_network(net["ssid"], password)
+            if ok:
+                status_msg, status_color = f"  ◉  connected to {net['ssid']}", 7
+                scan_done.clear()
+                threading.Thread(target=do_scan, daemon=True).start()
+            else:
+                status_msg, status_color = f"  ✗  failed to connect — wrong password?", 9
+
+        elif key in (ord("d"), ord("D")):
+            ssid_now = get_active_ssid()
+            if not ssid_now:
+                status_msg, status_color = "  not connected to anything", 8
+            else:
+                disconnect_network()
+                status_msg, status_color = f"  ○  disconnected from {ssid_now}", 7
+
+        elif key in (ord("f"), ord("F")):
+            if not networks:
+                continue
+            net   = networks[selected]
+            saved = get_saved_networks()
+            if net["ssid"] not in saved:
+                status_msg, status_color = f"  {net['ssid']} is not a saved network", 8
+            else:
+                forget_network(net["ssid"])
+                status_msg, status_color = f"  forgot {net['ssid']}", 7
+
+        elif key in (ord("t"), ord("T")):
+            toggle_wifi()
+            on    = get_wifi_enabled()
+            status_msg, status_color = (
+                ("  wifi enabled", 7) if on else ("  wifi disabled", 8)
+            )
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.system("tput cnorm 2>/dev/null")
