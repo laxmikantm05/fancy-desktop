@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+music — YouTube Music + Local Files TUI
+install : sudo cp music /usr/local/bin/ && sudo chmod +x /usr/local/bin/music
+deps    : pip install textual ytmusicapi yt-dlp --break-system-packages
+          sudo dnf install mpv
+setup   : music --setup  (Google OAuth for liked songs)
+"""
+
+import sys, os, subprocess, threading, time, json, socket, pathlib, shutil, glob
+
+# ── help ──────────────────────────────────────────────────────────────────────
+
+if "--help" in sys.argv or "-h" in sys.argv:
+    print("""music — YouTube Music + Local Files TUI
+
+  /        focus search
+  Tab      cycle filter (songs / videos)
+  Enter    play selected
+  Space    pause / resume
+  n / p    next / previous
+  , / .    seek -5s / +5s
+  a        add to queue
+  d        download as mp3
+  c        clear queue
+  l        liked songs (needs --setup)
+  + / -    volume up / down
+  q        quit
+
+  music --setup    Google login for liked songs
+""")
+    sys.exit(0)
+
+if "--setup" in sys.argv:
+    p = pathlib.Path.home() / ".config" / "fancy-desktop" / "ytmusic_auth.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    print("\n  opening browser for Google login...\n")
+    try:
+        from ytmusicapi import YTMusic
+        try:
+            # ytmusicapi >= 1.0
+            YTMusic.setup_oauth(filepath=str(p), open_browser=True)
+        except TypeError:
+            # fallback
+            YTMusic.setup_oauth(filepath=str(p))
+        print(f"\n  done. saved to {p}\n  run music and press [L] for liked songs\n")
+    except Exception as e:
+        print(f"  failed: {e}\n")
+    sys.exit(0)
+
+# ── dep check ─────────────────────────────────────────────────────────────────
+
+missing = []
+for d in ["mpv", "yt-dlp"]:
+    if not shutil.which(d): missing.append(d)
+try:    import ytmusicapi
+except: missing.append("ytmusicapi  (pip install ytmusicapi --break-system-packages)")
+try:    from textual.app import App
+except: missing.append("textual  (pip install textual --break-system-packages)")
+if missing:
+    print("\n  missing deps:\n" + "\n".join(f"    {m}" for m in missing) + "\n")
+    sys.exit(1)
+
+from ytmusicapi         import YTMusic
+from textual.app        import App, ComposeResult, Screen
+from textual.widgets    import ListView, ListItem, Label, Static, Input, Button
+from textual.containers import Horizontal, Vertical, Container
+from textual.binding    import Binding
+from textual            import work, on
+
+AUTH = pathlib.Path.home() / ".config" / "fancy-desktop" / "ytmusic_auth.json"
+
+# ── mpv ───────────────────────────────────────────────────────────────────────
+
+MPV_SOCK = "/tmp/music-mpv.sock"
+
+class Mpv:
+    def __init__(self):
+        self._proc = None; self._lock = threading.Lock()
+        self.paused = False; self.volume = 80
+
+    def _cmd(self, cmd, want_reply=False):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1); s.connect(MPV_SOCK)
+            s.sendall((json.dumps(cmd) + "\n").encode())
+            if want_reply:
+                d = json.loads(s.recv(4096).decode())
+                s.close(); return d.get("data")
+            s.close()
+        except: return None
+
+    def play(self, url):
+        self.stop(); time.sleep(0.15)
+        with self._lock:
+            self._proc = subprocess.Popen(
+                ["mpv", "--no-video", "--really-quiet",
+                 f"--volume={self.volume}",
+                 f"--input-ipc-server={MPV_SOCK}", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.paused = False
+
+    def stop(self):
+        with self._lock:
+            if self._proc:
+                try: self._proc.terminate(); self._proc.wait(timeout=2)
+                except:
+                    try: self._proc.kill()
+                    except: pass
+                self._proc = None; self.paused = False
+
+    def toggle_pause(self):
+        self._cmd({"command": ["cycle", "pause"]}); self.paused = not self.paused
+
+    def seek(self, s): self._cmd({"command": ["seek", s, "relative"]})
+    def set_vol(self, v):
+        self.volume = max(0, min(130, v))
+        self._cmd({"command": ["set_property", "volume", self.volume]})
+    def pos(self):
+        v = self._cmd({"command": ["get_property", "time-pos"]}, want_reply=True)
+        return float(v) if v is not None else 0.0
+    def dur(self):
+        v = self._cmd({"command": ["get_property", "duration"]}, want_reply=True)
+        return float(v) if v is not None else 0.0
+    def alive(self):
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
+
+MPV = Mpv()
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def fmt(s):
+    s = int(max(0, s)); return f"{s//60:02d}:{s%60:02d}"
+
+def pbar(pos, dur, w=36):
+    if dur <= 0: return "░" * w
+    n = int(min(pos/dur, 1.0) * w)
+    return "█" * n + "░" * (w - n)
+
+def stream_url(vid):
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "-x", "--audio-format", "best", "-g", "--no-playlist",
+             "--quiet", "--no-warnings",
+             f"https://music.youtube.com/watch?v={vid}"],
+            capture_output=True, text=True, timeout=20)
+        lines = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith("http")]
+        return lines[0] if lines else None
+    except: return None
+
+def dl_track(vid, title):
+    d = str(pathlib.Path.home() / "Music" / "ytmusic")
+    os.makedirs(d, exist_ok=True)
+    safe = "".join(c for c in title if c.isalnum() or c in " -_")[:80]
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+             "-o", f"{d}/{safe}.%(ext)s", "--no-playlist",
+             "--quiet", "--no-warnings",
+             f"https://music.youtube.com/watch?v={vid}"],
+            capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, d
+    except Exception as e: return False, str(e)
+
+def search_ytm(query, ft="songs", limit=30):
+    try:
+        yt = YTMusic(str(AUTH)) if AUTH.exists() else YTMusic()
+        results = yt.search(query, filter=ft, limit=limit) or []
+        tracks = []
+        for r in results:
+            vid = r.get("videoId") or r.get("id") or ""
+            if not vid: continue
+            title = r.get("title") or "Unknown"
+            arts  = r.get("artists") or []
+            art   = ", ".join(a.get("name","") for a in arts if a.get("name")) if isinstance(arts,list) else ""
+            dur   = r.get("duration") or ""
+            tracks.append({"id":vid,"title":title,"artist":art,"duration":dur,"source":"online"})
+        return tracks
+    except Exception as e:
+        return []
+
+def get_liked():
+    try:
+        yt = YTMusic(str(AUTH))
+        tracks = []
+        for r in (yt.get_liked_songs(limit=100).get("tracks") or []):
+            vid = r.get("videoId") or ""
+            if not vid: continue
+            title = r.get("title") or "Unknown"
+            arts  = r.get("artists") or []
+            art   = ", ".join(a.get("name","") for a in arts if a.get("name")) if isinstance(arts,list) else ""
+            dur   = r.get("duration") or ""
+            tracks.append({"id":vid,"title":title,"artist":art,"duration":dur,"source":"online"})
+        return tracks
+    except: return []
+
+def scan_local(folder):
+    exts = ("*.mp3","*.flac","*.ogg","*.wav","*.m4a","*.opus","*.aac")
+    files = []
+    for ext in exts:
+        files.extend(glob.glob(os.path.join(folder, "**", ext), recursive=True))
+    tracks = []
+    for f in sorted(files):
+        name = os.path.splitext(os.path.basename(f))[0]
+        tracks.append({"id":f,"title":name,"artist":"local","duration":"","source":"local"})
+    return tracks
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+
+APP_CSS = """
+Screen { background: #0f0f0f; color: #e0e0e0; }
+
+/* ── top search bar ── */
+#topbar {
+    height: 3; dock: top;
+    background: #1a1a1a; border-bottom: solid #ff4444;
+    layout: horizontal; padding: 0 1;
+}
+#logo { width: 10; height: 3; content-align: left middle; color: #ff4444; text-style: bold; }
+#search-input {
+    width: 1fr; height: 3; border: none;
+    background: #1a1a1a; color: #e0e0e0;
+    border-left: solid #333; padding: 0 1;
+}
+#search-input:focus { border-left: solid #ff4444; }
+#filter-lbl { width: 14; height: 3; content-align: right middle; color: #555; padding: 0 2; }
+
+/* ── bottom player ── */
+#player {
+    height: 4; dock: bottom;
+    background: #1a1a1a; border-top: solid #ff4444;
+    layout: vertical;
+}
+#player-top {
+    height: 2; layout: horizontal;
+    background: #1a1a1a; padding: 0 2;
+    content-align: left middle;
+}
+#player-info { width: 1fr; height: 2; content-align: left middle; color: #e0e0e0; }
+#player-ctrl { width: 30; height: 2; content-align: right middle; color: #888; }
+#player-prog { height: 1; background: #1a1a1a; padding: 0 2; content-align: left middle; color: #888; }
+
+/* ── controls hint ── */
+#hints {
+    height: 1; dock: bottom;
+    background: #111; color: #444;
+    padding: 0 2; content-align: left middle;
+    border-top: solid #222;
+}
+
+/* ── body ── */
+#body { height: 1fr; }
+#left  { width: 55%; border-right: solid #222; }
+#right { width: 1fr; }
+
+/* ── panel headers ── */
+.hdr {
+    height: 3; background: #1a1a1a; color: #ff4444;
+    text-style: bold; content-align: left middle;
+    padding: 0 2; border-bottom: solid #222;
+}
+
+/* ── lists ── */
+ListView {
+    background: #0f0f0f; height: 1fr;
+    scrollbar-color: #ff4444; scrollbar-background: #0f0f0f;
+    border: none; padding: 0;
+}
+ListView:focus { border: none; outline: none; }
+ListItem {
+    padding: 0; height: 2; background: #0f0f0f;
+    border-bottom: solid #161616;
+}
+ListItem:hover { background: #1a1a1a; }
+
+/* results highlight — cyan block */
+#results > ListItem.--highlight           { background: #00eeff; }
+#results:focus > ListItem.--highlight     { background: #00eeff; }
+#results:focus > ListItem.--highlight Label { color: #001a20; text-style: bold; }
+
+/* queue highlight — teal */
+#queue > ListItem.--highlight             { background: #005566; }
+#queue:focus > ListItem.--highlight       { background: #007788; }
+#queue:focus > ListItem.--highlight Label { color: #e0ffff; text-style: bold; }
+
+/* ── now playing ── */
+#nowplaying {
+    height: 8; background: #141414;
+    border-bottom: solid #222; padding: 1 2;
+}
+
+/* ── home screen ── */
+HomeScreen { background: #0f0f0f; align: center middle; }
+#home-box {
+    width: 50; height: 18;
+    border: solid #ff4444; background: #0f0f0f;
+    padding: 1 2; align: center middle;
+    layout: vertical;
+}
+#home-title { color: #ff4444; text-style: bold; height: 3; content-align: center middle; }
+#home-sub   { color: #666; height: 2; content-align: center middle; }
+.home-btn {
+    height: 3; margin: 1 2;
+    background: #1a1a1a; color: #e0e0e0;
+    border: solid #333;
+}
+.home-btn:hover { background: #ff4444; color: #fff; border: solid #ff4444; }
+#btn-local { margin-top: 2; }
+"""
+
+# ── home screen ───────────────────────────────────────────────────────────────
+
+class HomeScreen(Screen):
+    BINDINGS = [Binding("q", "quit", "Quit"), Binding("escape", "quit", "", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="home-box"):
+            yield Label("  MUSIC", id="home-title")
+            yield Label("choose a source", id="home-sub")
+            yield Button("  Online  —  YouTube Music", id="btn-online", classes="home-btn")
+            yield Button("  Local   —  Files on disk", id="btn-local",  classes="home-btn")
+
+    @on(Button.Pressed, "#btn-online")
+    def go_online(self): self.app.push_screen(MusicApp(mode="online"))
+
+    @on(Button.Pressed, "#btn-local")
+    def go_local(self):  self.app.push_screen(LocalPickerScreen())
+
+    def action_quit(self): self.app.exit()
+
+# ── local folder picker ───────────────────────────────────────────────────────
+
+class LocalPickerScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("enter",  "pick",  "", show=False),
+        Binding("q",      "back",  "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="home-box"):
+            yield Label("  LOCAL FILES", id="home-title")
+            yield Label("enter folder path", id="home-sub")
+            yield Input(
+                value=str(pathlib.Path.home() / "Music"),
+                placeholder="  /home/you/Music",
+                id="folder-input")
+            yield Button("  Scan folder", id="btn-scan", classes="home-btn")
+            yield Label("", id="scan-status")
+
+    def on_mount(self):
+        self.query_one("#folder-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-scan")
+    def scan(self):
+        folder = self.query_one("#folder-input", Input).value.strip()
+        if not os.path.isdir(folder):
+            self.query_one("#scan-status", Label).update("  folder not found")
+            return
+        self.app.push_screen(MusicApp(mode="local", local_folder=folder))
+
+    @on(Input.Submitted, "#folder-input")
+    def submitted(self, e): self.scan()
+
+    def action_back(self): self.app.pop_screen()
+
+# ── main music screen ─────────────────────────────────────────────────────────
+
+class MusicApp(Screen):
+    BINDINGS = [
+        Binding("/",         "focus_search", "/ Search"),
+        Binding("enter",     "play",         "", show=False),
+        Binding("space",     "pause",        "Spc Pause"),
+        Binding("n",         "nxt",          "N Next"),
+        Binding("p",         "prv",          "P Prev"),
+        Binding("comma",     "seek_back",    ", -5s"),
+        Binding("full_stop", "seek_fwd",     ". +5s"),
+        Binding("a",         "add_q",        "A Queue"),
+        Binding("d",         "download",     "D DL"),
+        Binding("c",         "clear_q",      "C Clear"),
+        Binding("l",         "library",      "L Liked"),
+        Binding("+",         "vol_up",       "+ Vol+"),
+        Binding("-",         "vol_dn",       "- Vol-"),
+        Binding("q",         "back",         "Q Back"),
+        Binding("escape",    "back",         "", show=False),
+    ]
+
+    def __init__(self, mode="online", local_folder=None):
+        super().__init__()
+        self.mode = mode
+        self.local_folder = local_folder
+        self._results = []
+        self._queue   = []
+        self._qidx    = -1
+        self._now     = None
+        self._filter  = "songs"
+        self._FILTERS = ["songs", "videos"]
+
+    def compose(self) -> ComposeResult:
+        # topbar
+        with Horizontal(id="topbar"):
+            yield Label("  MUSIC", id="logo")
+            if self.mode == "online":
+                yield Input(placeholder="  search YouTube Music...", id="search-input")
+                yield Label("songs [Tab]", id="filter-lbl")
+            else:
+                yield Label(
+                    f"  Local: {self.local_folder}",
+                    id="search-input")
+                yield Label("", id="filter-lbl")
+        # body
+        with Horizontal(id="body"):
+            with Vertical(id="left"):
+                yield Label("  RESULTS", classes="hdr", id="res-hdr")
+                yield ListView(id="results")
+            with Vertical(id="right"):
+                yield Static("", id="nowplaying")
+                yield Label("  QUEUE", classes="hdr", id="q-hdr")
+                yield ListView(id="queue")
+        # player
+        with Vertical(id="player"):
+            with Horizontal(id="player-top"):
+                yield Static("  nothing playing", id="player-info", markup=False)
+                yield Static("<<  >  >>", id="player-ctrl", markup=False)
+            yield Static("  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  --:-- / --:--  vol 80%",
+                         id="player-prog", markup=False)
+        # hints
+        yield Static(
+            "  [/] Search  [Enter] Play  [Spc] Pause  [N/P] Skip  [,/.] Seek"
+            "  [A] Queue  [D] Download  [L] Liked  [+/-] Vol  [Q] Back",
+            id="hints", markup=False)
+
+    def on_mount(self):
+        self._refresh_np()
+        self._refresh_pb()
+        if self.mode == "local":
+            self._load_local()
+        else:
+            try:
+                self.query_one("#search-input", Input).focus()
+            except Exception:
+                pass
+        self.set_interval(1, self._tick)
+
+    # ── auto-advance ──
+
+    def _tick(self):
+        if not MPV.alive() and self._now and not MPV.paused:
+            if self._qidx < len(self._queue) - 1:
+                self._qidx += 1
+                self._play(self._queue[self._qidx])
+        self._refresh_pb()
+
+    # ── now playing display ──
+
+    def _refresh_np(self):
+        w = self.query_one("#nowplaying", Static)
+        t = self._now
+        if t is None:
+            w.update("  nothing playing\n\n  search and press Enter to play")
+            return
+        icon = "> playing" if MPV.alive() and not MPV.paused else "|| paused"
+        lines = [
+            "",
+            f"  {t['title'][:50]}",
+            f"  {t['artist'][:40]}",
+            "",
+            f"  {icon}   vol {MPV.volume}%",
+        ]
+        w.update("\n".join(lines))
+
+    # ── progress bar ──
+
+    def _refresh_pb(self):
+        wp = self.query_one("#player-prog", Static)
+        wi = self.query_one("#player-info", Static)
+        wc = self.query_one("#player-ctrl", Static)
+        if not self._now:
+            wp.update("  [" + "░"*36 + "]  --:-- / --:--  vol " + str(MPV.volume) + "%")
+            wi.update("  nothing playing")
+            wc.update("<<  >  >>")
+            return
+        pos = MPV.pos(); dur = MPV.dur()
+        bar = pbar(pos, dur, 36)
+        icon = ">" if MPV.alive() and not MPV.paused else "||"
+        t = self._now
+        wi.update(f"  {t['title'][:40]}  —  {t['artist'][:25]}")
+        wc.update(f"<<  {icon}  >>")
+        wp.update(f"  [{bar}]  {fmt(pos)} / {fmt(dur)}  vol {MPV.volume}%")
+
+    # ── list builders ──
+
+    def _rebuild_results(self):
+        lv = self.query_one("#results", ListView)
+        lv.clear()
+        self.query_one("#res-hdr", Label).update(
+            f"  RESULTS ({len(self._results)})")
+        for i, t in enumerate(self._results):
+            playing = self._now and self._now["id"] == t["id"]
+            pre = ">" if playing else " "
+            row = f"  {pre} {i+1:>2}  {t['title'][:38]}  {t['artist'][:20]}  {t['duration'][:5]}"
+            lv.append(ListItem(Label(row, markup=False)))
+
+    def _rebuild_queue(self):
+        lv = self.query_one("#queue", ListView)
+        lv.clear()
+        self.query_one("#q-hdr", Label).update(
+            f"  QUEUE ({len(self._queue)})")
+        for i, t in enumerate(self._queue):
+            playing = i == self._qidx
+            pre = ">" if playing else " "
+            row = f"  {pre} {i+1:>2}  {t['title'][:28]}  {t['artist'][:18]}"
+            lv.append(ListItem(Label(row, markup=False)))
+
+    def _status(self, msg):
+        self.query_one("#player-info", Static).update(f"  {msg}")
+
+    # ── play ──
+
+    def _play(self, track):
+        self._now = track
+        self._refresh_np()
+        self._refresh_pb()
+        self._rebuild_results()
+        self._rebuild_queue()
+        self._status(f"  loading: {track['title'][:40]}...")
+        if track["source"] == "local":
+            MPV.play(track["id"])
+            self._status(f"  > {track['title'][:40]}")
+            self._refresh_np()
+        else:
+            self._stream(track)
+
+    @work(thread=True)
+    def _stream(self, track):
+        url = stream_url(track["id"])
+        if not url:
+            self.app.call_from_thread(self._status, f"  stream failed: {track['title'][:30]}")
+            return
+        MPV.play(url)
+        self.app.call_from_thread(self._status, f"  > {track['title'][:40]} - {track['artist'][:25]}")
+        self.app.call_from_thread(self._refresh_np)
+
+    # ── actions ──
+
+    def action_focus_search(self):
+        if self.mode == "online":
+            try: self.query_one("#search-input", Input).focus()
+            except: pass
+
+    def action_play(self):
+        if self.mode == "online":
+            try:
+                si = self.query_one("#search-input", Input)
+                if si.has_focus:
+                    q = si.value.strip()
+                    if q: self._do_search(q)
+                    return
+            except: pass
+        lv  = self.query_one("#results", ListView)
+        idx = lv.index
+        if idx is None or idx >= len(self._results): return
+        t = self._results[idx]
+        self._queue.append(t)
+        self._qidx = len(self._queue) - 1
+        self._play(t)
+
+    @work(thread=True)
+    def _do_search(self, q):
+        self.app.call_from_thread(self._status, f"  searching: {q[:30]}...")
+        results = search_ytm(q, self._filter)
+        if not results:
+            self.app.call_from_thread(self._status, f"  no results for: {q[:30]}")
+            return
+        self._results = results
+        self.app.call_from_thread(self._rebuild_results)
+        self.app.call_from_thread(self._status, f"  {len(results)} results")
+        self.app.call_from_thread(self.query_one("#results").focus)
+
+    @work(thread=True)
+    def _load_local(self):
+        self.app.call_from_thread(self._status, "  scanning local files...")
+        tracks = scan_local(self.local_folder)
+        self._results = tracks
+        self.app.call_from_thread(self._rebuild_results)
+        self.app.call_from_thread(self._status, f"  {len(tracks)} local files")
+        self.app.call_from_thread(self.query_one("#results").focus)
+
+    def action_pause(self):
+        if not self._now: return
+        MPV.toggle_pause()
+        self._refresh_np(); self._refresh_pb()
+
+    def action_nxt(self):
+        if self._qidx < len(self._queue) - 1:
+            self._qidx += 1; self._play(self._queue[self._qidx])
+
+    def action_prv(self):
+        if self._qidx > 0:
+            self._qidx -= 1; self._play(self._queue[self._qidx])
+
+    def action_seek_back(self):
+        if MPV.alive(): MPV.seek(-5); self._refresh_pb()
+
+    def action_seek_fwd(self):
+        if MPV.alive(): MPV.seek(5); self._refresh_pb()
+
+    def action_add_q(self):
+        lv  = self.query_one("#results", ListView)
+        idx = lv.index
+        if idx is None or idx >= len(self._results): return
+        t = self._results[idx]
+        self._queue.append(t); self._rebuild_queue()
+        self._status(f"  queued: {t['title'][:30]}")
+
+    @work(thread=True)
+    def action_download(self):
+        lv  = self.query_one("#results", ListView)
+        idx = lv.index
+        if idx is None or idx >= len(self._results): return
+        t = self._results[idx]
+        if t["source"] != "online":
+            self.app.call_from_thread(self._status, "  already local"); return
+        self.app.call_from_thread(self._status, f"  downloading {t['title'][:30]}...")
+        ok, path = dl_track(t["id"], t["title"])
+        self.app.call_from_thread(self._status,
+            f"  saved to {path}" if ok else "  download failed")
+
+    def action_clear_q(self):
+        MPV.stop(); self._queue = []; self._qidx = -1; self._now = None
+        self._rebuild_queue(); self._refresh_np(); self._refresh_pb()
+
+    @work(thread=True)
+    def action_library(self):
+        if not AUTH.exists():
+            self.app.call_from_thread(self._status, "  run: music --setup"); return
+        self.app.call_from_thread(self._status, "  loading liked songs...")
+        tracks = get_liked()
+        if not tracks:
+            self.app.call_from_thread(self._status, "  no liked songs found"); return
+        self._results = tracks
+        self.app.call_from_thread(self._rebuild_results)
+        self.app.call_from_thread(self._status, f"  {len(tracks)} liked songs")
+        self.app.call_from_thread(self.query_one("#results").focus)
+
+    def action_vol_up(self):  MPV.set_vol(MPV.volume + 5); self._refresh_pb()
+    def action_vol_dn(self):  MPV.set_vol(MPV.volume - 5); self._refresh_pb()
+
+    def action_back(self):
+        MPV.stop()
+        self.app.pop_screen()
+
+    # ── Tab cycles filter ──
+
+    def on_key(self, event):
+        if event.key == "tab" and self.mode == "online":
+            try:
+                si = self.query_one("#search-input", Input)
+                if si.has_focus:
+                    event.stop()
+                    i = self._FILTERS.index(self._filter)
+                    self._filter = self._FILTERS[(i+1) % len(self._FILTERS)]
+                    self.query_one("#filter-lbl", Label).update(
+                        f"{self._filter} [Tab]")
+            except: pass
+
+    @on(Input.Submitted, "#search-input")
+    def on_search(self, e):
+        q = e.value.strip()
+        if q: self._do_search(q)
+
+    @on(ListView.Selected, "#results")
+    def on_res_sel(self, e): self.action_play()
+
+    @on(ListView.Selected, "#queue")
+    def on_q_sel(self, e):
+        idx = e.list_view.index
+        if idx is not None and idx < len(self._queue):
+            self._qidx = idx; self._play(self._queue[idx])
+
+# ── root app ──────────────────────────────────────────────────────────────────
+
+class Root(App):
+    CSS = APP_CSS
+
+    def on_mount(self):
+        self.push_screen(HomeScreen())
+
+
+if __name__ == "__main__":
+    try: Root().run()
+    finally: MPV.stop()
