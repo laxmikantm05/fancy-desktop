@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""
+music  --  ytmusic-tui  (urwid edition)
+install:  sudo cp music /usr/local/bin/ && sudo chmod +x /usr/local/bin/music
+deps:     pip install urwid ytmusicapi yt-dlp --break-system-packages
+          sudo dnf install mpv
+setup:    music --setup   (terminal OAuth -- copy URL to any browser)
+"""
+import sys, os, subprocess, threading, time, json, socket, pathlib, shutil, glob
+
+if "--help" in sys.argv:
+    print("""music  --  ytmusic-tui
+  / or s   search         Enter  play
+  Space    pause          n/p    next/prev
+  < / >    seek -5/+5s    a      add to queue
+  d        download mp3   l      liked songs
+  o        browse ~/Music c      clear queue
+  + / -    volume         Tab    results/queue
+  x        remove from queue     q      quit
+  music --setup   (terminal login, copy URL to browser)
+"""); sys.exit(0)
+
+if "--setup" in sys.argv:
+    p = pathlib.Path.home() / ".config" / "fancy-desktop" / "ytmusic_auth.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    print("\n  ytmusic-tui  --  Google login")
+    print("  A URL will appear below.")
+    print("  Open it on any device, sign in, then press Enter here.\n")
+    ok = False
+    for fn in [
+        lambda: __import__("ytmusicapi").setup_oauth(filepath=str(p), open_browser=False),
+        lambda: __import__("ytmusicapi").YTMusic.setup_oauth(filepath=str(p), open_browser=False),
+        lambda: __import__("ytmusicapi").YTMusic.setup_oauth(filepath=str(p)),
+    ]:
+        try: fn(); ok = True; break
+        except: pass
+    if ok: print(f"\n  saved to {p}\n  press [L] inside music for liked songs\n")
+    else:  print("  failed -- try: pip install 'ytmusicapi[oauth]' --break-system-packages\n")
+    sys.exit(0)
+
+missing = []
+for d in ["mpv", "yt-dlp"]:
+    if not shutil.which(d): missing.append(d)
+try:    import ytmusicapi
+except: missing.append("ytmusicapi  (pip install ytmusicapi --break-system-packages)")
+try:    import urwid
+except: missing.append("urwid  (pip install urwid --break-system-packages)")
+if missing:
+    print("\n  missing:\n" + "\n".join(f"    {m}" for m in missing)); sys.exit(1)
+
+import urwid
+from ytmusicapi import YTMusic
+
+AUTH     = pathlib.Path.home() / ".config" / "fancy-desktop" / "ytmusic_auth.json"
+MPV_SOCK = "/tmp/music-mpv.sock"
+
+# ─── palette ──────────────────────────────────────────────────────────────────
+# 5-tuple format: (name, fg_16, bg_16, mono, fg_256, bg_256)
+# All backgrounds transparent ("default") so terminal wallpaper shows through
+PALETTE = [
+    #  name           fg_16          bg_16      mono      fg_256          bg_256
+    ("default",       "default",     "default"),
+    ("dim",           "dark gray",   "default", "",       "g46",          "default"),
+    ("white",         "white",       "default", "",       "white",        "default"),
+    ("bold",          "white,bold",  "default", "bold",   "white,bold",   "default"),
+
+    # YT Music red accent
+    ("red",           "dark red",    "default", "",       "#ff0033",      "default"),
+    ("red_bold",      "dark red,bold","default","bold",   "#ff0033,bold", "default"),
+    ("red_dim",       "dark red",    "default", "",       "#cc0022",      "default"),
+
+    # Selection highlight — red text on subtle bg
+    ("focus",         "dark red,bold","default","standout","#ff0033,bold","default"),
+    ("focus_queue",   "dark red,bold","default","standout","#ff0033,bold","default"),
+
+    # Now-playing row — red, no bg change (transparent)
+    ("playing",       "dark red,bold","default","bold",   "#ff0033,bold", "default"),
+
+    # Player bar
+    ("bar_fill",      "dark red",    "default", "",       "#ff0033",      "default"),
+    ("bar_empty",     "dark gray",   "default", "",       "g23",          "default"),
+    ("paused",        "yellow,bold", "default", "bold",   "#ffaa00,bold", "default"),
+
+    # Search input
+    ("input",         "white",       "default", "",       "white",        "default"),
+    ("input_focus",   "dark red",    "default", "",       "#ff0033",      "default"),
+
+    # Misc
+    ("hint",          "dark gray",   "default", "",       "g35",          "default"),
+    ("col_hdr",       "dark gray",   "default", "",       "g46",          "default"),
+    ("border",        "dark red",    "default", "",       "#ff0033",      "default"),
+    ("title",         "dark red,bold","default","bold",   "#ff0033,bold", "default"),
+]
+
+
+# ─── MPV backend ──────────────────────────────────────────────────────────────
+class Mpv:
+    def __init__(self):
+        self._proc = None; self._lock = threading.Lock()
+        self.paused = False; self.volume = 80
+        self._pos = 0.0; self._dur = 0.0; self._run = False
+
+    def _rpc(self, cmd, reply=False):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.4); s.connect(MPV_SOCK)
+            s.sendall((json.dumps(cmd) + "\n").encode())
+            if reply:
+                d = json.loads(s.recv(4096).decode()); s.close()
+                return d.get("data")
+            s.close()
+        except: return None
+
+    def _poll(self):
+        while self._run:
+            if self.alive():
+                v = self._rpc({"command": ["get_property", "time-pos"]}, reply=True)
+                if v is not None: self._pos = float(v)
+                v = self._rpc({"command": ["get_property", "duration"]}, reply=True)
+                if v is not None: self._dur = float(v)
+            time.sleep(0.5)
+
+    def play(self, url):
+        self.stop(); time.sleep(0.15)
+        with self._lock:
+            self._proc = subprocess.Popen(
+                ["mpv", "--no-video", "--really-quiet", "--no-ytdl",
+                 f"--volume={self.volume}", f"--input-ipc-server={MPV_SOCK}", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.paused = False; self._pos = 0.0; self._dur = 0.0
+        if not self._run:
+            self._run = True
+            threading.Thread(target=self._poll, daemon=True).start()
+
+    def stop(self):
+        with self._lock:
+            if self._proc:
+                try: self._proc.terminate(); self._proc.wait(timeout=2)
+                except:
+                    try: self._proc.kill()
+                    except: pass
+                self._proc = None; self.paused = False
+        self._pos = 0.0; self._dur = 0.0
+
+    def toggle_pause(self): self._rpc({"command": ["cycle", "pause"]}); self.paused = not self.paused
+    def seek(self, s):      self._rpc({"command": ["seek", s, "relative"]})
+    def set_vol(self, v):
+        self.volume = max(0, min(130, v))
+        self._rpc({"command": ["set_property", "volume", self.volume]})
+    def pos(self):  return self._pos
+    def dur(self):  return self._dur
+    def alive(self):
+        with self._lock: return self._proc is not None and self._proc.poll() is None
+    def cleanup(self): self._run = False; self.stop()
+
+MPV = Mpv()
+
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+def fmt(s):
+    s = int(max(0, s)); return f"{s//60:02d}:{s%60:02d}"
+
+def trunc(s, n):
+    s = str(s); return s if len(s) <= n else s[:n-1] + "…"
+
+def stream_url(vid):
+    """Pre-fetch direct audio CDN URL via yt-dlp using android client to avoid 429."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp",
+             "--extractor-args", "youtube:player_client=android",
+             "-f", "bestaudio/best",
+             "--no-playlist", "--quiet", "--no-warnings",
+             "--print", "url",
+             "--print", "duration",
+             f"https://www.youtube.com/watch?v={vid}"],
+            capture_output=True, text=True, timeout=30)
+        lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        url = next((l for l in lines if l.startswith("http")), None)
+        dur = 0.0
+        for l in lines:
+            try:
+                v = float(l)
+                if 0 < v < 86400:
+                    dur = v; break
+            except: pass
+        return url, dur
+    except Exception:
+        return None, 0.0
+
+def dl_track(vid, title):
+    d    = str(pathlib.Path.home() / "Music" / "ytmusic"); os.makedirs(d, exist_ok=True)
+    safe = "".join(c for c in title if c.isalnum() or c in " -_")[:80]
+    url  = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        r = subprocess.run(
+            ["yt-dlp",
+             "--extractor-args", "youtube:player_client=android",
+             "-f", "bestaudio/best",
+             "-x", "--audio-format", "mp3", "--audio-quality", "0",
+             "--no-playlist",
+             "-o", f"{d}/{safe}.%(ext)s",
+             url],
+            capture_output=True, text=True, timeout=180)
+        if r.returncode == 0:
+            return True, d
+        err = (r.stderr or r.stdout or "unknown error").strip().splitlines()
+        return False, next((l for l in err if l.strip()), "download failed")
+    except Exception as e:
+        return False, str(e)
+
+def search_ytm(q, limit=30):
+    try:
+        yt = YTMusic(str(AUTH)) if AUTH.exists() else YTMusic()
+        out = []
+        for r in (yt.search(q, filter="songs", limit=limit) or []):
+            vid = r.get("videoId") or r.get("id") or ""
+            if not vid: continue
+            arts = r.get("artists") or []
+            art = ", ".join(a.get("name", "") for a in arts if a.get("name")) \
+                  if isinstance(arts, list) else ""
+            out.append({"id": vid, "title": r.get("title") or "?",
+                        "artist": art, "duration": r.get("duration") or "", "source": "online"})
+        return out
+    except: return []
+
+def get_liked():
+    try:
+        out = []
+        for r in (YTMusic(str(AUTH)).get_liked_songs(limit=100).get("tracks") or []):
+            vid = r.get("videoId") or ""
+            if not vid: continue
+            arts = r.get("artists") or []
+            art = ", ".join(a.get("name", "") for a in arts if a.get("name")) \
+                  if isinstance(arts, list) else ""
+            out.append({"id": vid, "title": r.get("title") or "?",
+                        "artist": art, "duration": r.get("duration") or "", "source": "online"})
+        return out
+    except: return []
+
+def scan_local(folder):
+    files = []
+    for ext in ("*.mp3", "*.flac", "*.ogg", "*.wav", "*.m4a", "*.opus", "*.aac"):
+        files.extend(glob.glob(os.path.join(folder, "**", ext), recursive=True))
+    return [{"id": f, "title": os.path.splitext(os.path.basename(f))[0],
+             "artist": "local", "duration": "", "source": "local"} for f in sorted(files)]
+
+
+# ─── custom widgets ───────────────────────────────────────────────────────────
+
+class SearchEdit(urwid.Edit):
+    def __init__(self, on_submit):
+        super().__init__(caption=("dim", "  search: "))
+        self._on_submit = on_submit
+
+    def keypress(self, size, key):
+        if key == "enter":
+            self._on_submit(self.edit_text.strip())
+            return None
+        return super().keypress(size, key)
+
+
+class SelectableRow(urwid.WidgetWrap):
+    """A selectable row — swaps markup on focus so >> appears on the focused row.
+    wrap='clip' prevents text from wrapping to a second line (fixes ListBoxError)."""
+    def __init__(self, markup_normal, markup_focused=None, focus_map="focus"):
+        self._markup_normal  = markup_normal
+        self._markup_focused = markup_focused if markup_focused is not None else markup_normal
+        self._text   = urwid.Text(markup_normal, wrap='clip')   # clip not clip=True
+        self._mapped = urwid.AttrMap(self._text, None, focus_map)
+        super().__init__(self._mapped)
+
+    def render(self, size, focus=False):
+        self._text.set_text(self._markup_focused if focus else self._markup_normal)
+        return super().render(size, focus)
+
+    def selectable(self): return True
+    def keypress(self, size, key): return key
+
+
+# ─── app ──────────────────────────────────────────────────────────────────────
+class MusicApp:
+    def __init__(self):
+        self._res    = []
+        self._q      = []
+        self._qi     = -1
+        self._now    = None
+        self._view   = "search"
+        self._status = "  press / to search"
+        self._focus         = "results"   # "results" | "queue"
+        self._prefetched_dur = 0.0
+        self._repeat        = 0   # 0=off  1=one  2=all
+
+        # ── top bar ───────────────────────────────────────────────────────────
+        logo        = urwid.Text([("title", " YTMusic"), ("dim", "  │")])
+        self._sedit = SearchEdit(on_submit=self._do_search)
+        search_am   = urwid.AttrMap(self._sedit, "input", "input_focus")
+        view_lbl    = urwid.Text(("dim", "songs "), align="right")
+
+        topbar = urwid.Columns([
+            ("fixed", 12, logo),
+            search_am,
+            ("fixed", 8, view_lbl),
+        ], dividechars=1)
+
+        top_div   = urwid.AttrMap(urwid.Divider("─"), "border")
+        top_block = urwid.Pile([topbar, top_div])
+
+        # ── column header ─────────────────────────────────────────────────────
+        self._col_hdr = urwid.Text(("col_hdr",
+            f"  {'#':>3}  {'title':<40}  {'artist':<22}  time"))
+
+        # ── results list ──────────────────────────────────────────────────────
+        self._res_walker  = urwid.SimpleFocusListWalker([])
+        self._res_listbox = urwid.ListBox(self._res_walker)
+        results_area      = urwid.Frame(self._res_listbox, header=self._col_hdr)
+
+        # ── queue panel ───────────────────────────────────────────────────────
+        self._q_hdr    = urwid.Text(("col_hdr", "  queue"))
+        self._q_walker = urwid.SimpleFocusListWalker([])
+        self._q_box    = urwid.ListBox(self._q_walker)
+        queue_area     = urwid.Frame(self._q_box, header=self._q_hdr)
+
+        # Thin vertical divider between results and queue
+        q_div = urwid.AttrMap(urwid.SolidFill("│"), "border")
+
+        # ── body: results | divider | queue ───────────────────────────────────
+        body = urwid.Columns([
+            results_area,
+            ("fixed", 1,  q_div),
+            ("fixed", 30, queue_area),
+        ], dividechars=0)
+
+        # ── player footer ─────────────────────────────────────────────────────
+        player_div     = urwid.AttrMap(urwid.Divider("─"), "border")
+
+        self._p_icon   = urwid.Text(("dim", "  ──"), align="left")
+        self._p_repeat = urwid.Text(("dim", ""), align="right")
+        self._p_title  = urwid.Text(("dim", "  nothing playing"))
+        self._p_vol    = urwid.Text(("dim", "vol 80%"), align="right")
+
+        self._p_time_l = urwid.Text(("dim", "00:00"))
+        self._p_bar    = urwid.Text(("bar_empty", "─" * 40))
+        self._p_time_r = urwid.Text(("dim", "00:00"), align="right")
+        self._p_status = urwid.Text(("hint", ""))
+
+        row1 = urwid.Columns([
+            ("fixed", 5,  self._p_icon),
+            self._p_title,
+            ("fixed", 8,  self._p_repeat),
+            ("fixed", 10, self._p_vol),
+        ])
+        row2 = urwid.Columns([
+            ("fixed", 6, self._p_time_l),
+            self._p_bar,
+            ("fixed", 6, self._p_time_r),
+        ])
+
+        hint1 = urwid.Text(("hint",
+            "  [/] search  [↵] play  [Space] pause  [n] next  [p] prev  [<] -5s  [>] +5s"))
+        hint2 = urwid.Text(("hint",
+            "  [a] queue   [x] remove  [d] download  [c] clear  [r] repeat  [+][-] vol  [q] quit"))
+
+        footer = urwid.Pile([
+            player_div,
+            row1,
+            row2,
+            self._p_status,
+            hint1,
+            hint2,
+        ])
+
+        # ── root frame ────────────────────────────────────────────────────────
+        self._frame = urwid.Frame(
+            body   = body,
+            header = top_block,
+            footer = footer,
+        )
+
+        # 256-color screen for proper #ff0033 red
+        screen = urwid.raw_display.Screen()
+        screen.set_terminal_properties(colors=256)
+
+        self._loop = urwid.MainLoop(
+            self._frame,
+            palette         = PALETTE,
+            screen          = screen,
+            unhandled_input = self._handle_key,
+        )
+        self._pipe = self._loop.watch_pipe(self._on_pipe)
+
+    # ── pipe / refresh ────────────────────────────────────────────────────────
+    def _signal(self):
+        try: os.write(self._pipe, b"r")
+        except: pass
+
+    def _on_pipe(self, _data):
+        self._rebuild_results()
+        self._rebuild_queue()
+        self._draw_player()
+
+    # ── key handler ───────────────────────────────────────────────────────────
+    def _handle_key(self, key):
+        # Hand off to search box
+        if key in ("/", "s"):
+            self._frame.focus_position = "header"
+            return
+
+        # Tab: cycle focus between results and queue
+        if key == "tab":
+            if self._focus == "results":
+                self._focus = "queue"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 2
+                except Exception: pass
+            else:
+                self._focus = "results"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 0
+                except Exception: pass
+            return
+
+        if key == "enter":
+            # results: play selected
+            if self._focus == "results":
+                try:
+                    idx = self._res_listbox.focus_position
+                    self._play_at(idx)
+                except Exception: pass
+            # queue: jump to selected
+            elif self._focus == "queue":
+                try:
+                    idx = self._q_box.focus_position
+                    if 0 <= idx < len(self._q):
+                        self._qi = idx
+                        self._play(self._q[idx])
+                except Exception: pass
+            return
+
+        k = key.lower() if isinstance(key, str) else key
+
+        if   key == " ":  self._action_pause()
+        elif k   == "n":  self._action_next()
+        elif k   == "p":  self._action_prev()
+        elif key == ",":                           # actual key ,  shown as <
+            if MPV.alive(): MPV.seek(-5)
+        elif key == ".":                           # actual key .  shown as >
+            if MPV.alive(): MPV.seek(5)
+        elif k   == "a":  self._action_addq()
+        elif k   == "x":  self._action_removeq()
+        elif k   == "d":  threading.Thread(target=self._action_dl,    daemon=True).start()
+        elif k   == "l":  threading.Thread(target=self._action_liked, daemon=True).start()
+        elif k   == "o":  threading.Thread(target=self._action_local, daemon=True).start()
+        elif k   == "c":  self._action_clear()
+        elif key in ("+", "="):                    # actual key =  shown as +
+            MPV.set_vol(MPV.volume + 5);  self._draw_player()
+        elif key == "-":
+            MPV.set_vol(MPV.volume - 5);  self._draw_player()
+        elif k   == "r":  self._action_repeat()
+        elif k   == "q":  raise urwid.ExitMainLoop()
+
+    # ── player draw ───────────────────────────────────────────────────────────
+    def _draw_player(self):
+        t   = self._now
+        pos = MPV.pos()
+        dur = MPV.dur()
+
+        if t:
+            is_playing = MPV.alive() and not MPV.paused
+            if is_playing:
+                self._p_icon.set_text(("red_bold", "  ▶ "))
+            else:
+                self._p_icon.set_text(("paused",   "  || "))
+            self._p_title.set_text([
+                ("bold", f" {trunc(t['title'], 48)}"),
+                ("dim",  f"  —  {trunc(t['artist'], 24)}"),
+            ])
+        else:
+            self._p_icon.set_text(("dim", "  ── "))
+            self._p_title.set_text(("dim", "  nothing playing"))
+
+        self._p_vol.set_text(("dim", f"vol {MPV.volume}%"))
+        _rep_labels = {0: ("dim", "       "), 1: ("red_bold", " ↺ one "), 2: ("red_bold", " ↺ all ")}
+        self._p_repeat.set_text(_rep_labels[self._repeat])
+        self._p_time_l.set_text(("dim", fmt(pos)))
+        self._p_time_r.set_text(("dim", fmt(dur)))
+
+        if dur > 0:
+            W      = 40
+            filled = int(min(pos / dur, 1.0) * W)
+            empty  = W - filled
+            parts  = []
+            if filled: parts.append(("bar_fill",  "━" * filled))
+            if empty:  parts.append(("bar_empty", "─" * empty))
+            self._p_bar.set_text(parts)
+        else:
+            self._p_bar.set_text(("bar_empty", "─" * 40))
+
+        self._p_status.set_text(("hint", f"  {self._status}"))
+
+    # ── results rebuild ───────────────────────────────────────────────────────
+    def _rebuild_results(self):
+        n        = len(self._res)
+        view_lbl = {"search": f"results ({n})",
+                    "liked":  f"liked ({n})",
+                    "local":  f"files ({n})"}.get(self._view, "")
+        self._col_hdr.set_text([
+            ("col_hdr", f"  {'#':>3}  {'title':<40}  {'artist':<22}  time"),
+            ("dim",     f"   [{view_lbl}]"),
+        ])
+
+        rows = []
+        for i, t in enumerate(self._res):
+            playing = self._now and self._now["id"] == t["id"]
+            dur     = t["duration"][:5]
+            title   = trunc(t["title"],  40)
+            artist  = trunc(t["artist"], 22)
+            if playing:
+                markup_n = [
+                    ("red_bold", f"  ▶  {i+1:>3}  "),
+                    ("playing",  f"{title:<40}"),
+                    ("dim",      f"  {artist:<22}  "),
+                    ("dim",      dur),
+                ]
+                markup_f = [
+                    ("red_bold", f" »▶  {i+1:>3}  "),
+                    ("playing",  f"{title:<40}"),
+                    ("dim",      f"  {artist:<22}  "),
+                    ("dim",      dur),
+                ]
+            else:
+                markup_n = [
+                    ("dim",   f"     {i+1:>3}  "),
+                    ("white", f"{title:<40}"),
+                    ("dim",   f"  {artist:<22}  "),
+                    ("dim",   dur),
+                ]
+                markup_f = [
+                    ("red",   f"  »  {i+1:>3}  "),
+                    ("white", f"{title:<40}"),
+                    ("dim",   f"  {artist:<22}  "),
+                    ("dim",   dur),
+                ]
+            row = SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus")
+            rows.append(row)
+
+        # Preserve focus position if possible
+        try:    old_focus = self._res_listbox.focus_position
+        except: old_focus = 0
+
+        self._res_walker[:] = rows
+
+        if rows:
+            new_focus = min(old_focus, len(rows) - 1)
+            try: self._res_listbox.set_focus(new_focus)
+            except Exception: pass
+
+    # ── queue rebuild ─────────────────────────────────────────────────────────
+    def _rebuild_queue(self):
+        n = len(self._q)
+        self._q_hdr.set_text([
+            ("col_hdr", "  queue"),
+            ("dim",     f"  ({n})"),
+        ])
+
+        rows = []
+        for i, t in enumerate(self._q):
+            is_cur  = (i == self._qi)
+            dur     = t["duration"][:5]
+            title   = trunc(t["title"], 19)
+            if is_cur:
+                markup_n = [
+                    ("red_bold", " » "),
+                    ("playing",  f"{title:<19}"),
+                    ("dim",      f"  {dur:<5}"),
+                ]
+                markup_f = [
+                    ("red_bold", " » "),
+                    ("playing",  f"{title:<19}"),
+                    ("dim",      f"  {dur:<5}"),
+                ]
+            else:
+                markup_n = [
+                    ("dim",   "   "),
+                    ("white", f"{title:<19}"),
+                    ("dim",   f"  {dur:<5}"),
+                ]
+                markup_f = [
+                    ("red",   " » "),
+                    ("white", f"{title:<19}"),
+                    ("dim",   f"  {dur:<5}"),
+                ]
+            row = SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus_queue")
+            rows.append(row)
+
+        try:    old_focus = self._q_box.focus_position
+        except: old_focus = 0
+
+        self._q_walker[:] = rows
+
+        if rows:
+            new_focus = min(old_focus, len(rows) - 1)
+            try: self._q_box.set_focus(new_focus)
+            except Exception: pass
+
+    # ── playback ──────────────────────────────────────────────────────────────
+    def _play_at(self, idx):
+        if idx < 0 or idx >= len(self._res): return
+        t = self._res[idx]
+        # Add to queue if not already there
+        if t not in self._q:
+            self._q.append(t)
+        self._qi = self._q.index(t)
+        self._play(t)
+
+    def _play(self, track):
+        self._now    = track
+        self._status = f"loading: {trunc(track['title'], 40)}..."
+        self._rebuild_results()
+        self._rebuild_queue()
+        self._draw_player()
+        if track["source"] == "local":
+            MPV.play(track["id"])
+            self._status = trunc(track["title"], 50)
+            self._draw_player()
+        else:
+            threading.Thread(target=self._stream_thread, args=(track,), daemon=True).start()
+
+    def _stream_thread(self, track):
+        url, dur = stream_url(track["id"])
+        if not url:
+            self._status = "stream failed — try: pip install -U yt-dlp --break-system-packages"
+            self._signal(); return
+        self._prefetched_dur = dur
+        MPV.play(url)
+        self._status = trunc(track["title"], 50)
+        self._signal()
+
+    # ── tick ──────────────────────────────────────────────────────────────────
+    def _tick(self, loop, _data):
+        if not MPV.alive() and self._now and not MPV.paused:
+            if self._repeat == 1:                        # repeat one
+                self._play(self._q[self._qi])
+            elif self._qi < len(self._q) - 1:           # normal / repeat-all advance
+                self._qi += 1; self._play(self._q[self._qi])
+            elif self._repeat == 2 and self._q:          # repeat all — wrap to start
+                self._qi = 0; self._play(self._q[0])
+        self._draw_player()
+        self._loop.set_alarm_in(1, self._tick)
+
+    # ── actions ───────────────────────────────────────────────────────────────
+    def _do_search(self, q):
+        if not q: return
+        self._status = f"searching: {q[:30]}..."
+        self._draw_player()
+        # Shift focus back to results after submitting
+        try:
+            self._frame.focus_position = "body"
+            self._frame.body.focus_position = 0
+            self._focus = "results"
+        except Exception: pass
+        threading.Thread(target=self._search_thread, args=(q,), daemon=True).start()
+
+    def _search_thread(self, q):
+        results      = search_ytm(q)
+        self._res    = results
+        self._view   = "search"
+        self._status = f"{len(results)} results" if results else f"no results: {q[:30]}"
+        self._signal()
+
+    def _action_repeat(self):
+        self._repeat = (self._repeat + 1) % 3
+        labels = {0: "repeat off", 1: "repeat one", 2: "repeat all"}
+        self._status = labels[self._repeat]
+        self._draw_player()
+
+    def _action_pause(self):
+        if not self._now: return
+        MPV.toggle_pause(); self._draw_player()
+
+    def _action_next(self):
+        if self._qi < len(self._q) - 1:
+            self._qi += 1; self._play(self._q[self._qi])
+
+    def _action_prev(self):
+        if self._qi > 0:
+            self._qi -= 1; self._play(self._q[self._qi])
+
+    def _action_addq(self):
+        try:
+            idx = self._res_listbox.focus_position
+            if idx < len(self._res):
+                t = self._res[idx]
+                if t not in self._q:
+                    self._q.append(t)
+                    self._status = f"queued: {trunc(t['title'], 30)}"
+                else:
+                    self._status = "already in queue"
+                self._rebuild_queue()
+                self._draw_player()
+        except Exception: pass
+
+    def _action_removeq(self):
+        """Remove focused item from queue (x key)."""
+        try:
+            idx = self._q_box.focus_position
+            if 0 <= idx < len(self._q):
+                removed = self._q.pop(idx)
+                # Adjust current index
+                if self._qi >= idx and self._qi > 0:
+                    self._qi -= 1
+                self._status = f"removed: {trunc(removed['title'], 30)}"
+                self._rebuild_queue()
+                self._draw_player()
+        except Exception: pass
+
+    def _action_dl(self):
+        try:
+            idx = self._res_listbox.focus_position
+            if idx >= len(self._res): return
+            t = self._res[idx]
+            if t["source"] != "online":
+                self._status = "already local"; self._signal(); return
+            self._status = f"downloading {trunc(t['title'], 30)}..."; self._signal()
+            ok, path     = dl_track(t["id"], t["title"])
+            self._status = f"saved to {path}" if ok else "download failed"
+            self._signal()
+        except Exception: pass
+
+    def _action_liked(self):
+        if not AUTH.exists():
+            self._status = "run: music --setup"; self._signal(); return
+        self._status = "loading liked songs..."; self._signal()
+        tracks       = get_liked()
+        self._res    = tracks; self._view = "liked"
+        self._status = f"{len(tracks)} liked songs" if tracks else "no liked songs found"
+        self._signal()
+
+    def _action_local(self):
+        folder = str(pathlib.Path.home() / "Music")
+        if not os.path.isdir(folder):
+            self._status = "~/Music not found"; self._signal(); return
+        self._status = "scanning local files..."; self._signal()
+        tracks       = scan_local(folder)
+        self._res    = tracks; self._view = "local"
+        self._status = f"{len(tracks)} local files"
+        self._signal()
+
+    def _action_clear(self):
+        MPV.stop(); self._q = []; self._qi = -1; self._now = None
+        self._rebuild_results(); self._rebuild_queue(); self._draw_player()
+
+    # ── run ───────────────────────────────────────────────────────────────────
+    def run(self):
+        self._rebuild_results()
+        self._rebuild_queue()
+        self._draw_player()
+        self._loop.set_alarm_in(1, self._tick)
+        try:
+            self._loop.run()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        MusicApp().run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        MPV.cleanup()
